@@ -111,6 +111,8 @@ python recover_files.py carve --source C: --types images --restore-to "E:\Recove
 
 The script converts `C:` to the Windows raw volume path internally. If the drive is BitLocker-protected, unlock it before scanning.
 
+`WinError 87` usually means Windows rejected an unaligned raw-disk read. The tool performs sector-aligned reads internally, so rebuild the executable after updating the script if you are running `recover-files.exe`.
+
 ## Limitations
 
 File carving cannot usually restore original filenames, folder paths, fragmented files, or overwritten data. Large video files are often fragmented and may only recover when their data is still contiguous. For severe NTFS damage or high-value recovery, make a sector-by-sector image and consider a professional recovery workflow.

@@ -100,6 +100,9 @@ class WindowsRawReader:
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._configure_api()
         self._handle = self._open(source)
+        self._position = 0
+        self._sector_size = self._get_sector_size(source)
+        self._length = self._get_length()
 
     def _configure_api(self) -> None:
         self._kernel32.CreateFileW.argtypes = [
@@ -129,6 +132,25 @@ class WindowsRawReader:
         self._kernel32.SetFilePointerEx.restype = ctypes.c_int
         self._kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         self._kernel32.CloseHandle.restype = ctypes.c_int
+        self._kernel32.GetDiskFreeSpaceW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        self._kernel32.GetDiskFreeSpaceW.restype = ctypes.c_int
+        self._kernel32.DeviceIoControl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        self._kernel32.DeviceIoControl.restype = ctypes.c_int
 
     def _open(self, source: str) -> int:
         generic_read = 0x80000000
@@ -153,6 +175,45 @@ class WindowsRawReader:
             raise ctypes.WinError(ctypes.get_last_error())
         return handle
 
+    def _get_sector_size(self, source: str) -> int:
+        match = re.fullmatch(r"\\\\\.\\([A-Za-z]):", source)
+        if not match:
+            return 4096
+
+        sectors_per_cluster = ctypes.c_uint32(0)
+        bytes_per_sector = ctypes.c_uint32(0)
+        free_clusters = ctypes.c_uint32(0)
+        total_clusters = ctypes.c_uint32(0)
+        root = f"{match.group(1).upper()}:\\"
+        ok = self._kernel32.GetDiskFreeSpaceW(
+            root,
+            ctypes.byref(sectors_per_cluster),
+            ctypes.byref(bytes_per_sector),
+            ctypes.byref(free_clusters),
+            ctypes.byref(total_clusters),
+        )
+        if ok and bytes_per_sector.value:
+            return max(bytes_per_sector.value, 512)
+        return 4096
+
+    def _get_length(self) -> int | None:
+        ioctl_disk_get_length_info = 0x0007405C
+        output = ctypes.c_ulonglong(0)
+        returned = ctypes.c_uint32(0)
+        ok = self._kernel32.DeviceIoControl(
+            self._handle,
+            ioctl_disk_get_length_info,
+            None,
+            0,
+            ctypes.byref(output),
+            ctypes.sizeof(output),
+            ctypes.byref(returned),
+            None,
+        )
+        if ok:
+            return output.value
+        return None
+
     def close(self) -> None:
         if self._handle is not None:
             self._kernel32.CloseHandle(self._handle)
@@ -169,12 +230,32 @@ class WindowsRawReader:
             size = ONE_MIB
         if size == 0:
             return b""
-        buffer = ctypes.create_string_buffer(size)
+        if self._length is not None and self._position >= self._length:
+            return b""
+
+        requested_start = self._position
+        requested_end = requested_start + size
+        if self._length is not None:
+            requested_end = min(requested_end, self._length)
+        if requested_end <= requested_start:
+            return b""
+
+        sector = self._sector_size
+        aligned_start = requested_start - (requested_start % sector)
+        aligned_end = ((requested_end + sector - 1) // sector) * sector
+        if self._length is not None:
+            aligned_end = min(aligned_end, self._length)
+        aligned_size = aligned_end - aligned_start
+        if aligned_size <= 0:
+            return b""
+
+        self._set_file_pointer(aligned_start)
+        buffer = ctypes.create_string_buffer(aligned_size)
         bytes_read = ctypes.c_uint32(0)
         ok = self._kernel32.ReadFile(
             self._handle,
             buffer,
-            ctypes.c_uint32(size),
+            ctypes.c_uint32(aligned_size),
             ctypes.byref(bytes_read),
             None,
         )
@@ -183,22 +264,43 @@ class WindowsRawReader:
             if error == 38:
                 return b""
             raise ctypes.WinError(error)
-        return buffer.raw[: bytes_read.value]
+        relative_start = requested_start - aligned_start
+        available = max(0, bytes_read.value - relative_start)
+        result_size = min(requested_end - requested_start, available)
+        result = buffer.raw[relative_start : relative_start + result_size]
+        self._position += len(result)
+        return result
 
     def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            new_position = offset
+        elif whence == os.SEEK_CUR:
+            new_position = self._position + offset
+        elif whence == os.SEEK_END:
+            if self._length is None:
+                raise OSError("cannot seek from end because the raw device size is unknown")
+            new_position = self._length + offset
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        if new_position < 0:
+            raise OSError("negative seek position")
+        self._position = new_position
+        return self._position
+
+    def _set_file_pointer(self, offset: int) -> int:
         new_position = ctypes.c_longlong(0)
         ok = self._kernel32.SetFilePointerEx(
             self._handle,
             ctypes.c_longlong(offset),
             ctypes.byref(new_position),
-            ctypes.c_uint32(whence),
+            ctypes.c_uint32(os.SEEK_SET),
         )
         if not ok:
             raise ctypes.WinError(ctypes.get_last_error())
         return new_position.value
 
     def tell(self) -> int:
-        return self.seek(0, os.SEEK_CUR)
+        return self._position
 
 
 def normalize_extension(value: str) -> str:
