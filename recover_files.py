@@ -93,6 +93,114 @@ class SeekableReader:
         raise NotImplementedError
 
 
+class WindowsRawReader:
+    def __init__(self, source: str):
+        if os.name != "nt":
+            raise OSError("Windows raw device access is only available on Windows")
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._configure_api()
+        self._handle = self._open(source)
+
+    def _configure_api(self) -> None:
+        self._kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        self._kernel32.CreateFileW.restype = ctypes.c_void_p
+        self._kernel32.ReadFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        self._kernel32.ReadFile.restype = ctypes.c_int
+        self._kernel32.SetFilePointerEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_longlong),
+            ctypes.c_uint32,
+        ]
+        self._kernel32.SetFilePointerEx.restype = ctypes.c_int
+        self._kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._kernel32.CloseHandle.restype = ctypes.c_int
+
+    def _open(self, source: str) -> int:
+        generic_read = 0x80000000
+        file_share_read = 0x00000001
+        file_share_write = 0x00000002
+        file_share_delete = 0x00000004
+        open_existing = 3
+        file_attribute_normal = 0x00000080
+        invalid_handle_value = ctypes.c_void_p(-1).value
+
+        create_file = self._kernel32.CreateFileW
+        handle = create_file(
+            source,
+            generic_read,
+            file_share_read | file_share_write | file_share_delete,
+            None,
+            open_existing,
+            file_attribute_normal,
+            None,
+        )
+        if handle == invalid_handle_value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return handle
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> "WindowsRawReader":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = ONE_MIB
+        if size == 0:
+            return b""
+        buffer = ctypes.create_string_buffer(size)
+        bytes_read = ctypes.c_uint32(0)
+        ok = self._kernel32.ReadFile(
+            self._handle,
+            buffer,
+            ctypes.c_uint32(size),
+            ctypes.byref(bytes_read),
+            None,
+        )
+        if not ok:
+            error = ctypes.get_last_error()
+            if error == 38:
+                return b""
+            raise ctypes.WinError(error)
+        return buffer.raw[: bytes_read.value]
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        new_position = ctypes.c_longlong(0)
+        ok = self._kernel32.SetFilePointerEx(
+            self._handle,
+            ctypes.c_longlong(offset),
+            ctypes.byref(new_position),
+            ctypes.c_uint32(whence),
+        )
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return new_position.value
+
+    def tell(self) -> int:
+        return self.seek(0, os.SEEK_CUR)
+
+
 def normalize_extension(value: str) -> str:
     value = value.strip().lower()
     if not value:
@@ -501,6 +609,9 @@ def selected_carve_formats(types: Sequence[str], extensions: Sequence[str]) -> l
 def normalize_raw_source(source: str) -> str:
     source = source.strip()
     if os.name == "nt":
+        match = re.fullmatch(r"\\\\\.\\([A-Za-z]):\\?", source)
+        if match:
+            return f"\\\\.\\{match.group(1).upper()}:"
         match = re.fullmatch(r"([A-Za-z]):\\?", source)
         if match:
             return f"\\\\.\\{match.group(1).upper()}:"
@@ -508,6 +619,16 @@ def normalize_raw_source(source: str) -> str:
         if match:
             return f"\\\\.\\{match.group(1).upper()}:"
     return source
+
+
+def is_windows_raw_source(source: str) -> bool:
+    return os.name == "nt" and source.startswith("\\\\.\\")
+
+
+def open_carve_reader(source: str):
+    if is_windows_raw_source(source):
+        return WindowsRawReader(source)
+    return open(source, "rb")
 
 
 def copy_range(reader: SeekableReader, offset: int, length: int, destination: Path) -> None:
@@ -544,7 +665,7 @@ def carve_source(
     started = time.monotonic()
 
     print(f"[open] {source}")
-    with open(source, "rb", buffering=0) as reader:
+    with open_carve_reader(source) as reader:
         offset = 0
         carry = b""
         while True:

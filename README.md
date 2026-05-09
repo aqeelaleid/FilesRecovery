@@ -33,6 +33,14 @@ Carve deleted JPEG, PNG, PDF, ZIP/Office, MP4/MOV, AVI/WAV/WEBP, GIF, and BMP fi
 python recover_files.py carve --source E: --types all --restore-to "D:\Recovered"
 ```
 
+Carve the whole Windows `C:` volume:
+
+```powershell
+python recover_files.py carve --source C: --types images documents --restore-to "E:\Recovered"
+```
+
+For `C:`, open PowerShell or Command Prompt with **Run as administrator**. Use a restore folder on another physical disk, not on `C:`.
+
 Carve only photos from a disk image:
 
 ```powershell
@@ -92,6 +100,16 @@ Run it as Administrator when using `carve` against raw drives.
 3. Prefer scanning a disk image if you can make one first.
 4. Use `scan` if the files may simply be misplaced.
 5. Use `carve` if the files were deleted, the filesystem is damaged, or the partition is unreadable.
+
+## Troubleshooting
+
+If raw carving prints an error when opening `C:`, first confirm the terminal is elevated with **Run as administrator**. Prefer this source syntax:
+
+```powershell
+python recover_files.py carve --source C: --types images --restore-to "E:\Recovered"
+```
+
+The script converts `C:` to the Windows raw volume path internally. If the drive is BitLocker-protected, unlock it before scanning.
 
 ## Limitations
 
