@@ -27,6 +27,12 @@ Search all mounted drives for documents and images:
 python recover_files.py scan --all-drives --types documents images --restore-to "E:\Recovered"
 ```
 
+By default, `scan` skips common system and application locations such as `Windows`, `Program Files`, `ProgramData`, `AppData`, hidden files, and system files. To include them anyway:
+
+```powershell
+python recover_files.py scan --all-drives --types documents images --restore-to "E:\Recovered" --include-system-files
+```
+
 Carve deleted JPEG, PNG, PDF, ZIP/Office, MP4/MOV, AVI/WAV/WEBP, GIF, and BMP files from a USB drive:
 
 ```powershell
@@ -40,6 +46,20 @@ python recover_files.py carve --source C: --types images documents --restore-to 
 ```
 
 For `C:`, open PowerShell or Command Prompt with **Run as administrator**. Use a restore folder on another physical disk, not on `C:`.
+
+By default, `carve` uses user-file filters because raw carving cannot see the original folder or file owner. It skips files smaller than 32 KiB and images smaller than 400x400 pixels, which removes many Windows icons, thumbnails, browser cache fragments, and app assets.
+
+Adjust the filters if needed:
+
+```powershell
+python recover_files.py carve --source C: --types images --restore-to "E:\Recovered" --min-size-kb 256 --min-image-width 800 --min-image-height 600
+```
+
+Disable those carve filters:
+
+```powershell
+python recover_files.py carve --source C: --types images --restore-to "E:\Recovered" --include-system-files
+```
 
 Carve only photos from a disk image:
 
@@ -100,6 +120,7 @@ Run it as Administrator when using `carve` against raw drives.
 3. Prefer scanning a disk image if you can make one first.
 4. Use `scan` if the files may simply be misplaced.
 5. Use `carve` if the files were deleted, the filesystem is damaged, or the partition is unreadable.
+6. For fewer system/app results, search specific user categories and use stricter carve filters, for example `--types images documents --min-size-kb 128`.
 
 ## Troubleshooting
 
@@ -115,4 +136,4 @@ The script converts `C:` to the Windows raw volume path internally. If the drive
 
 ## Limitations
 
-File carving cannot usually restore original filenames, folder paths, fragmented files, or overwritten data. Large video files are often fragmented and may only recover when their data is still contiguous. For severe NTFS damage or high-value recovery, make a sector-by-sector image and consider a professional recovery workflow.
+File carving cannot usually restore original filenames, folder paths, owners, system/non-system status, fragmented files, or overwritten data. The user-file filters are heuristics, not perfect metadata recovery. Large video files are often fragmented and may only recover when their data is still contiguous. For severe NTFS damage or high-value recovery, make a sector-by-sector image and consider a professional recovery workflow.

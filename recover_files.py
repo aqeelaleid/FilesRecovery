@@ -82,6 +82,13 @@ class CarveFormat:
     carve: Callable[["SeekableReader", int, int], CarveHit | None]
 
 
+@dataclass(frozen=True)
+class RecoveryFilters:
+    min_size: int = 0
+    min_image_width: int = 0
+    min_image_height: int = 0
+
+
 class SeekableReader:
     def read(self, size: int = -1) -> bytes:
         raise NotImplementedError
@@ -385,7 +392,50 @@ def is_relative_to(child: Path, parent: Path) -> bool:
         return False
 
 
-def iter_existing_files(paths: Sequence[Path], restore_root: Path) -> Iterator[Path]:
+SYSTEM_DIR_NAMES = {
+    "$recycle.bin",
+    "$windows.~bt",
+    "$windows.~ws",
+    "appdata",
+    "config.msi",
+    "msocache",
+    "perflogs",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "recovery",
+    "system volume information",
+    "windows",
+}
+
+
+def is_likely_system_path(path: Path) -> bool:
+    return any(part.lower() in SYSTEM_DIR_NAMES for part in path.parts)
+
+
+def has_windows_system_attributes(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    if attributes == 0xFFFFFFFF:
+        return False
+    file_attribute_hidden = 0x00000002
+    file_attribute_system = 0x00000004
+    file_attribute_temporary = 0x00000100
+    return bool(attributes & (file_attribute_hidden | file_attribute_system | file_attribute_temporary))
+
+
+def should_skip_existing_path(path: Path, exclude_system_files: bool) -> bool:
+    if not exclude_system_files:
+        return False
+    return is_likely_system_path(path) or has_windows_system_attributes(path)
+
+
+def iter_existing_files(
+    paths: Sequence[Path],
+    restore_root: Path,
+    exclude_system_files: bool,
+) -> Iterator[Path]:
     restore_root = restore_root.resolve()
     for root in paths:
         root = root.expanduser()
@@ -393,7 +443,7 @@ def iter_existing_files(paths: Sequence[Path], restore_root: Path) -> Iterator[P
             print(f"[warn] path does not exist: {root}", file=sys.stderr)
             continue
         if root.is_file():
-            if root.resolve() != restore_root:
+            if root.resolve() != restore_root and not should_skip_existing_path(root, exclude_system_files):
                 yield root
             continue
         for current_root, dirnames, filenames in os.walk(root):
@@ -403,10 +453,15 @@ def iter_existing_files(paths: Sequence[Path], restore_root: Path) -> Iterator[P
                 candidate = (current_path / dirname).resolve()
                 if is_relative_to(candidate, restore_root):
                     continue
+                if should_skip_existing_path(candidate, exclude_system_files):
+                    continue
                 kept_dirs.append(dirname)
             dirnames[:] = kept_dirs
             for filename in filenames:
-                yield current_path / filename
+                candidate = current_path / filename
+                if should_skip_existing_path(candidate, exclude_system_files):
+                    continue
+                yield candidate
 
 
 def copy_existing_matches(
@@ -416,12 +471,13 @@ def copy_existing_matches(
     preserve_paths: bool,
     dry_run: bool,
     max_files: int | None,
+    exclude_system_files: bool,
 ) -> int:
     count = 0
     restore_root = ensure_restore_root(restore_root)
     roots = [path.expanduser().resolve() for path in paths]
 
-    for source in iter_existing_files(roots, restore_root):
+    for source in iter_existing_files(roots, restore_root, exclude_system_files):
         extension = source.suffix.lower()
         if extension not in extensions:
             continue
@@ -605,6 +661,96 @@ def carve_mp4(reader: SeekableReader, offset: int, max_size: int) -> CarveHit | 
     return None
 
 
+def parse_jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    if not data.startswith(b"\xff\xd8"):
+        return None
+    cursor = 2
+    sof_markers = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    while cursor + 4 < len(data):
+        if data[cursor] != 0xFF:
+            cursor += 1
+            continue
+        while cursor < len(data) and data[cursor] == 0xFF:
+            cursor += 1
+        if cursor >= len(data):
+            return None
+        marker = data[cursor]
+        cursor += 1
+        if marker in {0x01, *range(0xD0, 0xD9)}:
+            continue
+        if cursor + 2 > len(data):
+            return None
+        segment_length = struct.unpack_from(">H", data, cursor)[0]
+        if segment_length < 2:
+            return None
+        if marker in sof_markers and cursor + 7 <= len(data):
+            height = struct.unpack_from(">H", data, cursor + 3)[0]
+            width = struct.unpack_from(">H", data, cursor + 5)[0]
+            return width, height
+        cursor += segment_length
+    return None
+
+
+def image_dimensions(reader: SeekableReader, offset: int, length: int, extension: str) -> tuple[int, int] | None:
+    extension = extension.lower()
+    reader.seek(offset)
+    data = reader.read(min(length, 2 * ONE_MIB))
+    if extension in {".jpg", ".jpeg"}:
+        return parse_jpeg_dimensions(data)
+    if extension == ".png" and len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return struct.unpack_from(">II", data, 16)
+    if extension == ".gif" and len(data) >= 10 and data[:6] in {b"GIF87a", b"GIF89a"}:
+        return struct.unpack_from("<HH", data, 6)
+    if extension == ".bmp" and len(data) >= 26 and data.startswith(b"BM"):
+        width = struct.unpack_from("<i", data, 18)[0]
+        height = abs(struct.unpack_from("<i", data, 22)[0])
+        return width, height
+    if extension == ".webp" and len(data) >= 30 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        if data[12:16] == b"VP8X":
+            width = 1 + int.from_bytes(data[24:27], "little")
+            height = 1 + int.from_bytes(data[27:30], "little")
+            return width, height
+    return None
+
+
+def should_keep_carved_hit(
+    reader: SeekableReader,
+    offset: int,
+    hit: CarveHit,
+    filters: RecoveryFilters,
+) -> tuple[bool, str]:
+    if filters.min_size and hit.length < filters.min_size:
+        return False, f"smaller than {filters.min_size // 1024} KiB"
+
+    needs_image_check = (
+        hit.extension.lower() in CATEGORIES["images"]
+        and (filters.min_image_width or filters.min_image_height)
+    )
+    if needs_image_check:
+        dimensions = image_dimensions(reader, offset, hit.length, hit.extension)
+        if dimensions is not None:
+            width, height = dimensions
+            if filters.min_image_width and width < filters.min_image_width:
+                return False, f"image width {width}px below {filters.min_image_width}px"
+            if filters.min_image_height and height < filters.min_image_height:
+                return False, f"image height {height}px below {filters.min_image_height}px"
+    return True, "kept"
+
+
 def sniff_recovered_zip(path: Path) -> Path:
     try:
         with zipfile.ZipFile(path) as archive:
@@ -751,6 +897,7 @@ def carve_source(
     restore_root: Path,
     formats: Sequence[CarveFormat],
     allowed_extensions: set[str],
+    filters: RecoveryFilters,
     chunk_size: int,
     dry_run: bool,
     max_files: int | None,
@@ -795,6 +942,10 @@ def carve_source(
                     if hit is None:
                         continue
                     if hit.extension != ".zip" and hit.extension not in allowed_extensions:
+                        continue
+                    keep_hit, _reason = should_keep_carved_hit(reader, absolute_start, hit, filters)
+                    reader.seek(resume_at)
+                    if not keep_hit:
                         continue
 
                     name = f"recovered_{absolute_start:012x}_{hit.confidence}{hit.extension}"
@@ -847,6 +998,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     scan.add_argument("--flat", action="store_true", help="Do not preserve original folder paths.")
     scan.add_argument("--dry-run", action="store_true", help="Show what would be copied without writing files.")
     scan.add_argument("--max-files", type=int, help="Stop after recovering this many files.")
+    scan.add_argument(
+        "--include-system-files",
+        action="store_true",
+        help="Do not skip Windows, Program Files, ProgramData, AppData, hidden, or system files.",
+    )
 
     carve = subparsers.add_parser(
         "carve",
@@ -864,6 +1020,26 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     carve.add_argument("--chunk-size-mb", type=int, default=16, help="Raw read chunk size in MiB.")
     carve.add_argument("--dry-run", action="store_true", help="Show recoverable hits without writing files.")
     carve.add_argument("--max-files", type=int, help="Stop after recovering this many files.")
+    carve.add_argument(
+        "--include-system-files",
+        action="store_true",
+        help="Disable default user-file heuristics and recover tiny system/cache assets too.",
+    )
+    carve.add_argument(
+        "--min-size-kb",
+        type=int,
+        help="Skip carved files smaller than this. Default is 32 unless --include-system-files is used.",
+    )
+    carve.add_argument(
+        "--min-image-width",
+        type=int,
+        help="Skip carved images narrower than this. Default is 400 unless --include-system-files is used.",
+    )
+    carve.add_argument(
+        "--min-image-height",
+        type=int,
+        help="Skip carved images shorter than this. Default is 400 unless --include-system-files is used.",
+    )
 
     return parser.parse_args(argv)
 
@@ -887,6 +1063,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 preserve_paths=not args.flat,
                 dry_run=args.dry_run,
                 max_files=args.max_files,
+                exclude_system_files=not args.include_system_files,
             )
             print(f"[done] copied {count} file(s)")
             return 0
@@ -894,11 +1071,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "carve":
             extensions = selected_extensions(args.types, args.extensions)
             formats = selected_carve_formats(args.types, args.extensions)
+            min_size_kb = args.min_size_kb
+            min_image_width = args.min_image_width
+            min_image_height = args.min_image_height
+            if min_size_kb is None:
+                min_size_kb = 0 if args.include_system_files else 32
+            if min_image_width is None:
+                min_image_width = 0 if args.include_system_files else 400
+            if min_image_height is None:
+                min_image_height = 0 if args.include_system_files else 400
+            filters = RecoveryFilters(
+                min_size=max(0, min_size_kb) * 1024,
+                min_image_width=max(0, min_image_width),
+                min_image_height=max(0, min_image_height),
+            )
             count = carve_source(
                 source=args.source,
                 restore_root=args.restore_to,
                 formats=formats,
                 allowed_extensions=extensions,
+                filters=filters,
                 chunk_size=max(1, args.chunk_size_mb) * ONE_MIB,
                 dry_run=args.dry_run,
                 max_files=args.max_files,

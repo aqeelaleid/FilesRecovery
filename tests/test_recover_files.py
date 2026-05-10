@@ -30,6 +30,7 @@ class RecoverFilesTests(unittest.TestCase):
             preserve_paths=False,
             dry_run=False,
             max_files=None,
+            exclude_system_files=True,
         )
 
         self.assertEqual(count, 1)
@@ -48,6 +49,7 @@ class RecoverFilesTests(unittest.TestCase):
             restore_root=restore,
             formats=[fmt for fmt in recover_files.CARVE_FORMATS if fmt.name == "jpeg"],
             allowed_extensions={".jpg", ".jpeg"},
+            filters=recover_files.RecoveryFilters(),
             chunk_size=64,
             dry_run=False,
             max_files=None,
@@ -81,6 +83,17 @@ class RecoverFilesTests(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit.length, len(payload))
         self.assertEqual(hit.extension, ".mp4")
+
+    def test_user_filters_skip_small_carved_files(self):
+        keep, reason = recover_files.should_keep_carved_hit(
+            reader=io.BytesIO(b"abc"),
+            offset=0,
+            hit=recover_files.CarveHit(length=3, extension=".pdf"),
+            filters=recover_files.RecoveryFilters(min_size=1024),
+        )
+
+        self.assertFalse(keep)
+        self.assertIn("smaller", reason)
 
 
 if __name__ == "__main__":
